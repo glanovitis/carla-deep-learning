@@ -11,6 +11,8 @@ import torch.optim as optim
 from torch.distributions import Normal
 import cv2
 import random
+import time
+import psutil
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -349,34 +351,102 @@ def preprocess_image(image):
     return image
 
 
-def safe_destroy_actors(client, actor_list):
-    """Safely destroy actors with comprehensive error handling"""
-    if not actor_list:
-        return
+def destroy_all_actors(client, world):
+    """Very aggressive actor cleanup that tries multiple approaches"""
+    print("Performing aggressive actor cleanup...")
 
-    commands = []
-    for actor in actor_list:
-        try:
-            if actor is not None and hasattr(actor, 'is_alive') and actor.is_alive:
-                commands.append(carla.command.DestroyActor(actor))
-        except Exception as e:
-            print(f"Error preparing actor for destruction: {e}")
+    # Save original settings
+    original_settings = world.get_settings()
 
-    if commands:
+    # Step 1: Switch to synchronous mode to ensure commands complete
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.05
+    world.apply_settings(settings)
+
+    # Step 2: Stop all controllers first (they control walkers)
+    controllers = world.get_actors().filter('controller.ai.*')
+    for controller in controllers:
         try:
-            results = client.apply_batch_sync(commands, True)
-            # Check for success/failure
-            success = 0
-            failed = 0
-            for result in results:
-                if result.error:
-                    failed += 1
-                else:
-                    success += 1
-            if failed > 0:
-                print(f"Actor destruction: {success} succeeded, {failed} failed")
-        except Exception as e:
-            print(f"Error in batch destroy: {e}")
+            if controller.is_alive:
+                controller.stop()
+        except:
+            pass
+
+    # Tick to process stop commands
+    world.tick()
+    time.sleep(0.5)
+
+    # Step 3: Group actors by type for ordered destruction
+    vehicles = world.get_actors().filter('vehicle.*')
+    walkers = world.get_actors().filter('walker.*')
+    sensors = world.get_actors().filter('sensor.*')
+
+    # Count actors
+    print(f"Found {len(vehicles)} vehicles, {len(walkers)} walkers, " 
+          f"{len(controllers)} controllers, {len(sensors)} sensors")
+
+    # Step 4: First attempt - destroy sensors first (they're attached to vehicles)
+    destroy_count = 0
+
+    for sensor in sensors:
+        try:
+            if sensor.is_alive:
+                sensor.destroy()
+                destroy_count += 1
+        except:
+            pass
+
+    # Tick to process destroy commands
+    world.tick()
+
+    # Step 5: Use synchronous batch commands for remaining actors
+    # This ensures CARLA processes each batch before moving to the next
+    for actor_list in [controllers, walkers, vehicles]:
+        if actor_list:
+            # Try batch destroy with verification
+            try:
+                print(f"Destroying {len(actor_list)} actors...")
+                batch = [carla.command.DestroyActor(x) for x in actor_list]
+                responses = client.apply_batch_sync(batch, True)
+
+                # Count successes/failures
+                success = sum(1 for r in responses if not r.has_error())
+                failure = len(responses) - success
+                print(f"Batch destroy: {success} succeeded, {failure} failed")
+                destroy_count += success
+            except Exception as e:
+                print(f"Batch destroy failed: {e}")
+
+                # Fallback to individual destruction with ticks
+                for actor in actor_list:
+                    try:
+                        if actor.is_alive:
+                            actor.destroy()
+                            destroy_count += 1
+                            # Tick after each destroy to ensure it's processed
+                            world.tick()
+                    except:
+                        pass
+
+        # Tick after each batch
+        world.tick()
+
+    # Step 6: Final verification and cleanup
+    time.sleep(1.0)
+
+    # Count remaining actors
+    remaining_actors = len(world.get_actors().filter('vehicle.*')) + \
+                      len(world.get_actors().filter('walker.*')) + \
+                      len(world.get_actors().filter('controller.ai.*')) + \
+                      len(world.get_actors().filter('sensor.*'))
+
+    print(f"Cleanup results: {destroy_count} actors destroyed, {remaining_actors} actors remain")
+
+    # Restore original settings
+    world.apply_settings(original_settings)
+
+    return remaining_actors == 0
 
 def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000):
     try:
@@ -393,6 +463,9 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000):
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05
         world.apply_settings(settings)
+
+        checkpoint_interval = 5  # Save every 5 episodes
+        checkpoint_path = "carla_checkpoint.pth"
 
         # Create an agent
         agent = PPOAgent(state_dim=(3, 84, 84), action_dim=3)  # RGB image input, 84x84 resolution
@@ -486,26 +559,44 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000):
                 if episode % 10 == 0:
                     agent.save(f"carla_ppo_checkpoint_ep{episode}.pth")
 
+                    # Save training checkpoint with more details
+                    if episode % checkpoint_interval == 0:
+                        torch.save({
+                            'episode': episode,
+                            'model_state_dict': agent.policy.state_dict(),
+                            'optimizer_state_dict': agent.optimizer.state_dict(),
+                            'best_reward': best_reward,
+                        }, checkpoint_path)
+                        print(f"Checkpoint saved at episode {episode}")
+
+                        process = psutil.Process(os.getpid())
+                        print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
             except Exception as e:
                 print(f"Error in episode {episode + 1}: {e}")
             finally:
-                # Clean up ego vehicle
-                if 'ego_vehicle' in locals():
-                    ego_vehicle.destroy()
+                # Cleanup ego vehicle first
+                if 'ego_vehicle' in locals() and ego_vehicle:
+                    try:
+                        ego_vehicle.destroy()
+                        print("Ego vehicle destroyed")
+                    except Exception as e:
+                        print(f"Error destroying ego vehicle: {e}")
 
-                # Clean up traffic
-                if 'controllers' in locals() and controllers:
-                    for c in controllers:
-                        try:
-                            if c.is_alive:
-                                c.stop()
-                        except:
-                            pass
-                    safe_destroy_actors(client, controllers)
-                if 'walkers' in locals() and walkers:
-                    safe_destroy_actors(client, walkers)
-                if 'vehicles' in locals() and vehicles:
-                    safe_destroy_actors(client, vehicles)
+                # Now clean up all other actors
+                try:
+                    destroy_all_actors(client, world)
+                    print("Actors destroyed")
+                except Exception as e:
+                    print(f"Error during actor cleanup: {e}")
+
+                # Restore original settings
+                if 'original_settings' in locals() and original_settings:
+                    try:
+                        world.apply_settings(original_settings)
+                        print("Original settings restored")
+                    except Exception as e:
+                        print(f"Error restoring original settings: {e}")
 
         # Save final model
         agent.save("carla_ppo_final.pth")

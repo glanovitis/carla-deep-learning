@@ -21,7 +21,7 @@ import carla
 
 
 class EgoVehicle:
-    def __init__(self, world, vehicle_type='lincoln.mkz_2017',transform=None):
+    def __init__(self, world, vehicle_type='lincoln.mkz_2017', transform=None):
         """
         Creates an ego vehicle with various sensors
         """
@@ -163,33 +163,57 @@ class EgoVehicle:
         # Set callback for GNSS
         self.gnss_sensor.listen(lambda event: self._on_gnss_update(event))
 
-    def _process_rgb_image(self, image):
+    @staticmethod
+    def efficient_image_processing(image, is_rgb=True):
+        """
+        Process CARLA image data without memory leaks
+        Returns numpy array without saving to disk
+        """
+        # Convert raw data to numpy array
         array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
         array = np.reshape(array, (image.height, image.width, 4))
-        array = array[:, :, :3]  # Remove alpha channel
+
+        if is_rgb:
+            # RGB image processing - keep 3 channels
+            array = array[:, :, :3]  # Keep RGB channels only
+        else:
+            # Semantic segmentation - keep only first channel
+            array = array[:, :, 0]
+
+        return array.copy()  # Return a copy to ensure memory is properly managed
+
+    def _process_rgb_image(self, image):
+        """Memory-optimized RGB image processing"""
+        array = self.efficient_image_processing(image, is_rgb=True)
         self.sensor_data['rgb_front'] = array
         self.sensor_queues['rgb_front'].put(array)
 
     def _process_depth_image(self, image):
-        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-        array = np.reshape(array, (image.height, image.width, 4))
-        array = array[:, :, :3]  # Remove alpha channel
+        """Memory-optimized depth image processing"""
+        # Get raw data as uint8 array with RGB channels
+        array = self.efficient_image_processing(image, is_rgb=True)
 
-        # Convert to float32 before multiplication to avoid overflow
+        # Convert to float32 before depth calculation to avoid overflow
+        # Use astype(np.float32) instead of float which would use float64 and double memory usage
         array = array.astype(np.float32)
 
-        # Convert depth data to a more usable format
-        # Depth is encoded in the RGB values (R + G * 256 + B * 256^2) / (256^3 - 1) * 1000m
+        # Calculate depth - using vectorized operations for better performance
+        # Depth is encoded in the RGB values
         normalized = (array[:, :, 0] + array[:, :, 1] * 256 + array[:, :, 2] * 256 * 256) / (256 * 256 * 256 - 1)
         depth_meters = normalized * 1000  # Convert to meters
 
+        # Store only the depth map (single channel) to reduce memory usage
         self.sensor_data['depth_front'] = depth_meters
         self.sensor_queues['depth_front'].put(depth_meters)
 
     def _process_lidar_data(self, point_cloud):
-        data = np.copy(np.frombuffer(point_cloud.raw_data, dtype=np.dtype('f4')))
+        """Memory-optimized LIDAR processing"""
+        # Direct buffer access for better memory management
+        data = np.frombuffer(point_cloud.raw_data, dtype=np.dtype('f4'))
         data = np.reshape(data, (int(data.shape[0] / 4), 4))
-        self.sensor_data['lidar'] = data
+
+        # Store a copy to ensure the original buffer can be released
+        self.sensor_data['lidar'] = data.copy()
         self.sensor_queues['lidar'].put(data)
 
     def _on_collision(self, event):
