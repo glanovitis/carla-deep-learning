@@ -244,7 +244,12 @@ class PPOAgent:
         """
         Load a saved model
         """
-        self.policy.load_state_dict(torch.load(path))
+        try:
+            # Use weights_only=False to fix PyTorch 2.6 compatibility issue
+            self.policy.load_state_dict(torch.load(path, weights_only=False))
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            print("Using default weights instead")
 
 
 def attach_spectator_to_vehicle(world, vehicle, view_mode='third_person_rear'):
@@ -448,7 +453,8 @@ def destroy_all_actors(client, world):
 
     return remaining_actors == 0
 
-def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000):
+
+def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, start_episode=0):
     try:
         # Connect to CARLA server
         client = carla.Client('localhost', 2000)
@@ -468,15 +474,32 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000):
         checkpoint_path = "carla_checkpoint.pth"
 
         # Create an agent
-        agent = PPOAgent(state_dim=(3, 84, 84), action_dim=3)  # RGB image input, 84x84 resolution
+        agent = PPOAgent(state_dim=(3, 84, 84), action_dim=3)  # RGB image input
+
+        # Load existing model if continuing training
+        if start_episode > 0 and os.path.exists(checkpoint_path):
+            print(f"Loading model from checkpoint...")
+            try:
+                checkpoint = torch.load(checkpoint_path, weights_only=False)
+                agent.policy.load_state_dict(checkpoint['model_state_dict'])
+                agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                best_reward = checkpoint.get('best_reward', -float('inf'))
+                print(f"Checkpoint loaded, best reward: {best_reward}")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+                best_reward = -float('inf')
+        else:
+            best_reward = -float('inf')
 
         # Training variables
         total_steps = 0
-        best_reward = -float('inf')
 
         for episode in range(episodes):
+            # Calculate absolute episode number for logging
+            episode_number = start_episode + episode
+
             try:
-                print(f"Starting episode {episode + 1}/{episodes}")
+                print(f"Starting episode {episode_number + 1}/{start_episode + episodes}")
 
                 # Spawn traffic
                 vehicles, walkers, controllers = spawn_traffic(client, 20, 10)
