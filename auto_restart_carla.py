@@ -343,7 +343,7 @@ def run_training_with_recovery(episodes=100, checkpoint_path="carla_checkpoint.p
         try:
             # Connect to CARLA with a higher timeout
             client = carla.Client('localhost', 2000)
-            client.set_timeout(30.0)  # Even longer timeout for stability
+            client.set_timeout(20.0)
 
             # Get the world
             world = client.get_world()

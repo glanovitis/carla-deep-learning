@@ -117,7 +117,7 @@ class ActorCritic(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, state_dim, action_dim, lr=0.0003, gamma=0.99, epsilon=0.2, value_coef=0.5, entropy_coef=0.01):
+    def __init__(self, state_dim, action_dim, lr=0.06, gamma=0.99, epsilon=0.4, value_coef=0.5, entropy_coef=0.01):
         self.gamma = gamma
         self.epsilon = epsilon
         self.value_coef = value_coef
@@ -454,7 +454,7 @@ def destroy_all_actors(client, world):
     return remaining_actors == 0
 
 
-def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, start_episode=0):
+def train_agent(episodes=100, steps_per_episode=2000, update_frequency=200, start_episode=0):
     try:
         # Connect to CARLA server
         client = carla.Client('localhost', 2000)
@@ -470,7 +470,7 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, sta
         settings.fixed_delta_seconds = 0.05
         world.apply_settings(settings)
 
-        checkpoint_interval = 5  # Save every 5 episodes
+        checkpoint_interval = 2
         checkpoint_path = "carla_checkpoint.pth"
 
         # Create an agent
@@ -506,21 +506,32 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, sta
 
                 # Choose a random spawn point
                 spawn_points = world.get_map().get_spawn_points()
-                ego_transform = random.choice(spawn_points) if spawn_points else carla.Transform()
 
                 # Initialize variables before creating the ego_vehicle
                 episode_reward = 0
                 done = False
                 step = 0
 
+                # Initialize reward tracking variables
+                prev_location = None
+                prev_speed = None
+                distance_traveled = 0
+                prev_steering = None
+
+                # Initialize collision tracking - MOVE THIS HERE!
+                last_collision_step = None
+
                 # Creating the ego_vehicle
+                ego_transform = random.choice(spawn_points) if spawn_points else carla.Transform()
                 ego_vehicle = EgoVehicle(world)
-                prev_location = ego_vehicle.vehicle.get_transform().location
                 update_spectator = attach_spectator_to_vehicle(world, ego_vehicle.vehicle, 'first_person')
+
+                prev_location = ego_vehicle.vehicle.get_transform().location
 
                 # Main training loop
                 while not done and step < steps_per_episode:
                     # Process world tick
+                    # REMOVE THIS LINE: last_collision_step = None
                     world.tick()
 
                     # Update spectator position to follow the vehicle
@@ -533,6 +544,11 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, sta
                     # Select action
                     action, action_prob, value = agent.act(state)
 
+                    if total_steps < 5000 and random.random() < 0.3:  # 30% chance in first 5000 steps
+                        # Force high throttle, minimal brake, small random steering
+                        action[0] = random.uniform(0.7, 1.0)  # High throttle
+                        action[2] = random.uniform(0.0, 0.1)  # Minimal brake
+
                     # Convert action to CARLA control
                     control = carla.VehicleControl()
                     # Explicitly convert numpy.float32 to Python float
@@ -543,14 +559,26 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, sta
                     # Apply control to vehicle
                     ego_vehicle.apply_control(control)
 
-                    # Calculate reward
-                    reward, current_location = calculate_reward(ego_vehicle, prev_location)
-                    prev_location = current_location
+                    reward, current_location, current_speed, distance_traveled, current_steering, last_collision_step, episode_done = calculate_reward(
+                        ego_vehicle=ego_vehicle,
+                        prev_location=prev_location,
+                        prev_speed=prev_speed,
+                        distance_traveled=distance_traveled,
+                        total_steps=total_steps,
+                        prev_steering=prev_steering,
+                        target_speed=30,
+                        last_collision_step=last_collision_step  # Pass and update this
+                    )
 
-                    # Check for termination conditions
-                    if ego_vehicle.sensor_data['collision']:
-                        print("Collision detected! Ending episode.")
+                    # Only end episode for valid termination conditions
+                    if episode_done:
                         done = True
+                        print(f"Episode ending at step {step} - termination condition met")
+
+                    # Update tracking variables for next iteration
+                    prev_location = current_location
+                    prev_speed = current_speed
+                    prev_steering = current_steering
 
                     # Store experience
                     agent.remember(state, action, action_prob, reward, done, value)
@@ -566,7 +594,14 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, sta
 
                     step += 1
 
-                print(f"Episode {episode + 1} completed with reward: {episode_reward}")
+                    # Add debugging info - print if reward is significant
+                    if reward > 1.0 or reward < -1.0:
+                        print(
+                            f"Step {step}, Reward: {reward:.2f}, Speed: {current_speed:.2f} km/h, Distance: {distance_traveled:.2f}m")
+
+                # Episode summary with distance traveled
+                print(
+                    f"Episode {episode_number + 1} completed with reward: {episode_reward:.2f}, Distance: {distance_traveled:.2f}m")
 
                 # Update policy at the end of each episode if there's data
                 if len(agent.memory['states']) > 0:
@@ -582,18 +617,18 @@ def train_agent(episodes=100, steps_per_episode=1000, update_frequency=2000, sta
                 if episode % 10 == 0:
                     agent.save(f"carla_ppo_checkpoint_ep{episode}.pth")
 
-                    # Save training checkpoint with more details
-                    if episode % checkpoint_interval == 0:
-                        torch.save({
-                            'episode': episode,
-                            'model_state_dict': agent.policy.state_dict(),
-                            'optimizer_state_dict': agent.optimizer.state_dict(),
-                            'best_reward': best_reward,
-                        }, checkpoint_path)
-                        print(f"Checkpoint saved at episode {episode}")
+                # Save training checkpoint with more details
+                if episode % checkpoint_interval == 0:
+                    torch.save({
+                        'episode': episode,
+                        'model_state_dict': agent.policy.state_dict(),
+                        'optimizer_state_dict': agent.optimizer.state_dict(),
+                        'best_reward': best_reward,
+                    }, checkpoint_path)
+                    print(f"Checkpoint saved at episode {episode}")
 
-                        process = psutil.Process(os.getpid())
-                        print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+                    process = psutil.Process(os.getpid())
+                    print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
             except Exception as e:
                 print(f"Error in episode {episode + 1}: {e}")
